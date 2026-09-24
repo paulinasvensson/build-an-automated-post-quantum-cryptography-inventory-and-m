@@ -1,234 +1,190 @@
-import re
-from pathlib import Path
-from typing import Literal
-
-from fastapi import Depends, FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from entitlements import require_pro
+from scanner import scan_text, build_roadmap, Finding
 
 app = FastAPI(title="PQC Crypto Inventory Scanner")
-
-STATIC_DIR = Path(__file__).parent / "static"
-
-# ---------------------------------------------------------------------------
-# Detection engine
-# ---------------------------------------------------------------------------
-
-Severity = Literal["Critical", "High", "Medium", "Low"]
-
-# Each rule: (name, regex, category, severity, quantum_vulnerable, pqc_recommendation)
-RULES = [
-    (
-        "RSA key generation / usage",
-        re.compile(r"\bRSA\.(generate|new)\b|\brsa\.generate_private_key\b|\bBEGIN RSA PRIVATE KEY\b|\bRSAPrivateKey\b|\bgenrsa\b", re.I),
-        "Public-key encryption",
-        "Critical",
-        True,
-        "ML-KEM (Kyber) for key exchange; ML-DSA (Dilithium) or SLH-DSA for signatures",
-    ),
-    (
-        "Elliptic Curve Cryptography (ECC/ECDSA/ECDH)",
-        re.compile(r"\bECDSA\b|\bECDH\b|\bEllipticCurve\b|\bsecp256\w*\b|\bprime256v1\b|\becdsa\.\w+\b", re.I),
-        "Public-key encryption",
-        "Critical",
-        True,
-        "ML-DSA (Dilithium) for signatures; ML-KEM (Kyber) for key exchange",
-    ),
-    (
-        "Diffie-Hellman key exchange",
-        re.compile(r"\bDiffieHellman\b|\bDH\.generate\b|\bdhparam\b", re.I),
-        "Key exchange",
-        "Critical",
-        True,
-        "ML-KEM (Kyber) key encapsulation",
-    ),
-    (
-        "X.509 certificate / private key material",
-        re.compile(r"BEGIN CERTIFICATE|BEGIN PRIVATE KEY|BEGIN EC PRIVATE KEY", re.I),
-        "PKI / certificates",
-        "High",
-        True,
-        "Reissue with hybrid classical+PQC or pure ML-DSA certificate chain",
-    ),
-    (
-        "MD5 hash usage",
-        re.compile(r"\bMD5\b|\bmd5\(", re.I),
-        "Hashing",
-        "High",
-        False,
-        "Migrate to SHA-256 / SHA-3 (collision-resistance, not quantum-broken but deprecated)",
-    ),
-    (
-        "SHA-1 hash usage",
-        re.compile(r"\bSHA1\b|\bsha1\(", re.I),
-        "Hashing",
-        "Medium",
-        False,
-        "Migrate to SHA-256 / SHA-3",
-    ),
-    (
-        "3DES / DES cipher",
-        re.compile(r"\b3?DES\b|\bTripleDES\b", re.I),
-        "Symmetric encryption",
-        "High",
-        False,
-        "Migrate to AES-256-GCM (quantum-resistant with sufficient key size)",
-    ),
-    (
-        "RC4 stream cipher",
-        re.compile(r"\bRC4\b", re.I),
-        "Symmetric encryption",
-        "High",
-        False,
-        "Migrate to AES-256-GCM or ChaCha20-Poly1305",
-    ),
-    (
-        "Small RSA/DH key size (<= 2048 bit)",
-        re.compile(r"\b(512|1024)\s*[-_]?\s*bit\b|key_?size\s*=\s*(512|1024)\b", re.I),
-        "Key strength",
-        "Critical",
-        True,
-        "Increase to 3072/4096-bit as interim step, then migrate fully to PQC",
-    ),
-]
-
-
-class Finding(BaseModel):
-    rule: str
-    category: str
-    severity: Severity
-    quantum_vulnerable: bool
-    pqc_recommendation: str
-    line_number: int
-    snippet: str
-
-
-def scan_text(text: str) -> list[Finding]:
-    findings: list[Finding] = []
-    lines = text.splitlines()
-    for idx, line in enumerate(lines, start=1):
-        for name, pattern, category, severity, qvuln, rec in RULES:
-            if pattern.search(line):
-                findings.append(
-                    Finding(
-                        rule=name,
-                        category=category,
-                        severity=severity,
-                        quantum_vulnerable=qvuln,
-                        pqc_recommendation=rec,
-                        line_number=idx,
-                        snippet=line.strip()[:160],
-                    )
-                )
-    return findings
-
-
-SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-SEVERITY_TO_PHASE = {
-    "Critical": "Phase 1 — Immediate (0-6 months)",
-    "High": "Phase 2 — Near-term (6-12 months)",
-    "Medium": "Phase 3 — Mid-term (12-24 months)",
-    "Low": "Phase 4 — Long-term (24-36 months)",
-}
-SEVERITY_EFFORT = {
-    "Critical": "High effort — likely requires protocol/library redesign",
-    "High": "Medium-high effort — library swap + testing",
-    "Medium": "Medium effort — config/parameter change",
-    "Low": "Low effort — configuration update",
-}
 
 
 class ScanRequest(BaseModel):
     code: str
 
 
-class ScanResponse(BaseModel):
-    findings: list[Finding]
-    summary: dict
+def _findings_to_dicts(findings: list[Finding]) -> list[dict]:
+    return [f.__dict__ for f in findings]
 
 
-@app.post("/api/scan", response_model=ScanResponse)
-def scan(req: ScanRequest):
-    """Free tier: scan pasted code/config and list crypto findings."""
+@app.post("/api/scan")
+async def api_scan(req: ScanRequest):
+    """Free feature: find quantum-vulnerable crypto usage in pasted text."""
     findings = scan_text(req.code)
-    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-    for f in findings:
-        counts[f.severity] += 1
     summary = {
         "total_findings": len(findings),
-        "by_severity": counts,
-        "quantum_vulnerable_count": sum(1 for f in findings if f.quantum_vulnerable),
+        "critical": sum(1 for f in findings if f.severity == "critical"),
+        "high": sum(1 for f in findings if f.severity == "high"),
+        "medium": sum(1 for f in findings if f.severity == "medium"),
     }
-    return ScanResponse(findings=findings, summary=summary)
+    return JSONResponse({"summary": summary, "findings": _findings_to_dicts(findings)})
 
 
-class RoadmapItem(BaseModel):
-    rule: str
-    severity: Severity
-    phase: str
-    effort: str
-    occurrences: int
-    pqc_recommendation: str
-
-
-class RoadmapResponse(BaseModel):
-    crypto_debt_score: int
-    roadmap: list[RoadmapItem]
-    narrative: str
-
-
-@app.post("/api/roadmap", response_model=RoadmapResponse, dependencies=[Depends(require_pro)])
-def roadmap(req: ScanRequest):
-    """Paid tier: full prioritized PQC migration roadmap."""
+@app.post("/api/roadmap")
+async def api_roadmap(req: ScanRequest, _license=Depends(require_pro)):
+    """Paid feature: full prioritized PQC migration roadmap."""
     findings = scan_text(req.code)
-
-    grouped: dict[str, dict] = {}
-    for f in findings:
-        g = grouped.setdefault(
-            f.rule,
-            {
-                "severity": f.severity,
-                "occurrences": 0,
-                "pqc_recommendation": f.pqc_recommendation,
-            },
-        )
-        g["occurrences"] += 1
-
-    items = [
-        RoadmapItem(
-            rule=rule,
-            severity=data["severity"],
-            phase=SEVERITY_TO_PHASE[data["severity"]],
-            effort=SEVERITY_EFFORT[data["severity"]],
-            occurrences=data["occurrences"],
-            pqc_recommendation=data["pqc_recommendation"],
-        )
-        for rule, data in grouped.items()
-    ]
-    items.sort(key=lambda i: (SEVERITY_ORDER[i.severity], -i.occurrences))
-
-    weight = {"Critical": 25, "High": 12, "Medium": 5, "Low": 1}
-    debt_score = min(100, sum(weight[i.severity] * i.occurrences for i in items))
-
-    if not items:
-        narrative = (
-            "No quantum-vulnerable or legacy cryptographic primitives were detected "
-            "in the submitted material. Continue periodic re-scanning as code and "
-            "dependencies evolve."
-        )
-    else:
-        narrative = (
-            f"Detected {len(items)} distinct crypto risk categories across "
-            f"{sum(i.occurrences for i in items)} occurrences. Crypto-debt score: "
-            f"{debt_score}/100. Prioritize Phase 1 items immediately to align with "
-            f"NSA CNSA 2.0 and NIST PQC migration timelines ahead of 2030-2035 deadlines."
-        )
-
-    return RoadmapResponse(crypto_debt_score=debt_score, roadmap=items, narrative=narrative)
+    roadmap = build_roadmap(findings)
+    return JSONResponse({"roadmap": roadmap, "total_algorithms": len(roadmap)})
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return FileResponse(STATIC_DIR / "index.html")
+async def root():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PQC Crypto Inventory Scanner</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+<div class="max-w-3xl mx-auto p-4">
+
+  <div class="mb-3">
+    <h1 class="text-lg font-semibold text-slate-900">Post-Quantum Crypto Inventory</h1>
+    <p class="text-sm text-slate-500">Paste code, config, or dependency manifests to find quantum-vulnerable crypto and get a prioritized migration roadmap.</p>
+  </div>
+
+  <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-4 mb-3">
+    <label class="block text-xs font-medium text-slate-600 mb-1">License Key (for full roadmap)</label>
+    <div class="flex gap-2">
+      <input id="licenseKey" type="text" placeholder="PQC-PRO-2024"
+        class="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+      <button onclick="saveLicense()" class="rounded-lg bg-slate-800 text-white text-sm px-3 py-1.5 hover:bg-slate-700">Save</button>
+    </div>
+    <p id="licenseStatus" class="text-xs text-slate-400 mt-1"></p>
+  </div>
+
+  <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-4">
+    <label class="block text-xs font-medium text-slate-600 mb-1">Paste code / TLS config / dependency file</label>
+    <textarea id="codeInput" rows="6" placeholder="e.g. RSA.generate(2048), hashlib.md5(...), ECDSA signature..."
+      class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+
+    <div class="flex gap-2 mt-3">
+      <button onclick="runScan()" class="rounded-lg bg-indigo-600 text-white text-sm font-medium px-4 py-2 hover:bg-indigo-700">
+        Scan for vulnerable crypto (free)
+      </button>
+      <button onclick="runRoadmap()" class="rounded-lg bg-emerald-600 text-white text-sm font-medium px-4 py-2 hover:bg-emerald-700">
+        Generate migration roadmap (pro)
+      </button>
+    </div>
+
+    <div id="result" class="mt-3 text-sm"></div>
+  </div>
+</div>
+
+<script>
+function saveLicense() {
+  const key = document.getElementById('licenseKey').value.trim();
+  localStorage.setItem('pqc_license_key', key);
+  document.getElementById('licenseStatus').textContent = key ? "License key saved." : "License key cleared.";
+}
+
+window.onload = () => {
+  const saved = localStorage.getItem('pqc_license_key');
+  if (saved) {
+    document.getElementById('licenseKey').value = saved;
+    document.getElementById('licenseStatus').textContent = "Saved license key loaded.";
+  }
+};
+
+function severityColor(sev) {
+  if (sev === 'critical') return 'text-red-600 bg-red-50 border-red-200';
+  if (sev === 'high') return 'text-orange-600 bg-orange-50 border-orange-200';
+  if (sev === 'medium') return 'text-amber-600 bg-amber-50 border-amber-200';
+  return 'text-slate-600 bg-slate-50 border-slate-200';
+}
+
+async function runScan() {
+  const code = document.getElementById('codeInput').value;
+  const resultEl = document.getElementById('result');
+  resultEl.innerHTML = '<p class="text-slate-400">Scanning...</p>';
+  try {
+    const res = await fetch('/api/scan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code})
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      resultEl.innerHTML = `<p class="text-red-600">Error: ${data.detail || 'scan failed'}</p>`;
+      return;
+    }
+    if (data.findings.length === 0) {
+      resultEl.innerHTML = '<p class="text-emerald-600">No legacy crypto primitives detected.</p>';
+      return;
+    }
+    let html = `<p class="mb-2 font-medium">${data.summary.total_findings} finding(s) — ${data.summary.critical} critical, ${data.summary.high} high, ${data.summary.medium} medium</p>`;
+    html += '<div class="space-y-1.5 max-h-48 overflow-y-auto pr-1">';
+    data.findings.forEach(f => {
+      html += `<div class="border rounded-lg px-3 py-2 text-xs ${severityColor(f.severity)}">
+        <span class="font-semibold">${f.algorithm}</span> (line ${f.line}, ${f.severity}) — <code class="opacity-80">${f.snippet}</code>
+      </div>`;
+    });
+    html += '</div>';
+    resultEl.innerHTML = html;
+  } catch (e) {
+    resultEl.innerHTML = `<p class="text-red-600">Network error: ${e}</p>`;
+  }
+}
+
+async function runRoadmap() {
+  const code = document.getElementById('codeInput').value;
+  const licenseKey = localStorage.getItem('pqc_license_key') || '';
+  const resultEl = document.getElementById('result');
+  resultEl.innerHTML = '<p class="text-slate-400">Generating roadmap...</p>';
+  try {
+    const res = await fetch('/api/roadmap', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-License-Key': licenseKey},
+      body: JSON.stringify({code})
+    });
+    const data = await res.json();
+    if (res.status === 402) {
+      resultEl.innerHTML = `<div class="border border-amber-300 bg-amber-50 text-amber-800 rounded-lg p-3 text-sm">
+        <strong>License required.</strong> ${data.detail} Enter your license key above and click Save, then try again.
+      </div>`;
+      return;
+    }
+    if (!res.ok) {
+      resultEl.innerHTML = `<p class="text-red-600">Error: ${data.detail || 'roadmap failed'}</p>`;
+      return;
+    }
+    if (data.roadmap.length === 0) {
+      resultEl.innerHTML = '<p class="text-emerald-600">No migration items — nothing quantum-vulnerable found.</p>';
+      return;
+    }
+    let html = `<p class="mb-2 font-medium">Migration roadmap — ${data.total_algorithms} algorithm(s), ranked by priority</p>`;
+    html += '<div class="space-y-1.5 max-h-56 overflow-y-auto pr-1">';
+    data.roadmap.forEach(r => {
+      html += `<div class="border rounded-lg px-3 py-2 text-xs ${severityColor(r.severity)}">
+        <div class="flex justify-between">
+          <span class="font-semibold">#${r.priority_rank} ${r.algorithm}</span>
+          <span>score ${r.priority_score}</span>
+        </div>
+        <div class="opacity-90 mt-1">${r.occurrences} occurrence(s), lines: ${r.lines.join(', ')}</div>
+        <div class="opacity-90 mt-1">Risk: ${r.risk}</div>
+        <div class="mt-1 font-medium">→ Migrate to: ${r.pqc_recommendation} (effort: ${r.effort})</div>
+      </div>`;
+    });
+    html += '</div>';
+    resultEl.innerHTML = html;
+  } catch (e) {
+    resultEl.innerHTML = `<p class="text-red-600">Network error: ${e}</p>`;
+  }
+}
+</script>
+</body>
+</html>
+""")
