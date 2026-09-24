@@ -1,132 +1,126 @@
 """
-Core detection logic for cryptographic primitives that are vulnerable to
-quantum attacks (or already deprecated), plus prioritized PQC migration
-guidance mapped to NIST FIPS 203/204/205 and NSA CNSA 2.0.
+Core cryptographic-inventory scanning logic.
+
+Given a blob of source code / config / dependency-manifest text, find
+usages of legacy (quantum-vulnerable) cryptographic primitives and map
+each finding to a NIST-approved post-quantum replacement.
 """
+
 import re
-from dataclasses import dataclass, asdict
-from typing import List, Dict
+from dataclasses import dataclass, field
+
+# algorithm -> (regex, severity, quantum_risk, pqc_recommendation, effort)
+PATTERNS: dict[str, dict] = {
+    "RSA": {
+        "regex": re.compile(r"\bRSA\b|rsa\.generate_private_key|RSA_generate_key|new\s+RSACryptoServiceProvider", re.I),
+        "severity": "critical",
+        "risk": "Broken by Shor's algorithm on a cryptographically relevant quantum computer.",
+        "pqc": "ML-KEM (Kyber) for key exchange + ML-DSA (Dilithium) for signatures",
+        "effort": "High",
+    },
+    "ECC/ECDSA/ECDH": {
+        "regex": re.compile(r"\bECDSA\b|\bECDH\b|EllipticCurve|SECP256|prime256v1|\bECC\b", re.I),
+        "severity": "critical",
+        "risk": "Broken by Shor's algorithm; equally vulnerable to RSA under quantum attack.",
+        "pqc": "ML-DSA (Dilithium) or SLH-DSA (SPHINCS+) for signatures; ML-KEM for exchange",
+        "effort": "High",
+    },
+    "DH (classic Diffie-Hellman)": {
+        "regex": re.compile(r"\bDiffieHellman\b|\bDH_generate_key\b|\bDHParameterSpec\b", re.I),
+        "severity": "high",
+        "risk": "Discrete-log based; broken by Shor's algorithm.",
+        "pqc": "ML-KEM (Kyber) hybrid key exchange",
+        "effort": "Medium",
+    },
+    "DES/3DES": {
+        "regex": re.compile(r"\bDES\b|3DES|TripleDES|DESede", re.I),
+        "severity": "high",
+        "risk": "Weak block cipher; effective security further reduced by Grover's algorithm.",
+        "pqc": "AES-256 (symmetric, quantum-resistant with sufficient key length)",
+        "effort": "Low",
+    },
+    "MD5": {
+        "regex": re.compile(r"\bMD5\b|hashlib\.md5|CryptoJS\.MD5", re.I),
+        "severity": "medium",
+        "risk": "Cryptographically broken hash; collision-prone regardless of quantum threat.",
+        "pqc": "SHA-3 / SHA-256 or higher",
+        "effort": "Low",
+    },
+    "SHA-1": {
+        "regex": re.compile(r"\bSHA-?1\b|hashlib\.sha1|CryptoJS\.SHA1", re.I),
+        "severity": "medium",
+        "risk": "Deprecated hash function; halved security margin under Grover's algorithm.",
+        "pqc": "SHA-256/SHA-3 family",
+        "effort": "Low",
+    },
+    "RC4": {
+        "regex": re.compile(r"\bRC4\b|ARCFOUR", re.I),
+        "severity": "high",
+        "risk": "Broken stream cipher, independent of quantum threat but flagged for CNSA 2.0 compliance.",
+        "pqc": "ChaCha20-Poly1305 / AES-256-GCM",
+        "effort": "Low",
+    },
+}
+
+SEVERITY_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
 
 @dataclass
-class Rule:
-    name: str
-    pattern: str
-    family: str
-    quantum_vulnerable: bool
-    risk: str  # critical | high | medium | low
-    recommendation: str
-    standard_ref: str
+class Finding:
+    algorithm: str
+    severity: str
+    line: int
+    snippet: str
+    risk: str
+    pqc_recommendation: str
+    effort: str
 
 
-RULES: List[Rule] = [
-    Rule("RSA key generation", r"\bRSA\b.{0,40}(generate|GenerateKey|new\s*\(\s*RSA)|rsa\.generate_private_key",
-         "RSA", True, "critical",
-         "Replace with ML-KEM (FIPS 203) for key exchange and ML-DSA (FIPS 204) for signatures.",
-         "NIST FIPS 203/204, CNSA 2.0 (2030 deadline)"),
-    Rule("RSA reference", r"\bRSA-?\d{3,4}\b|RSAPrivateKey|RSAPublicKey|PKCS1|rsa\.PublicKey",
-         "RSA", True, "high",
-         "Migrate signature/exchange logic to ML-DSA / ML-KEM.",
-         "NIST FIPS 203/204"),
-    Rule("Elliptic curve crypto", r"\bECDSA\b|\bECDH\b|EllipticCurve|secp256r1|secp384r1|prime256v1|NIST P-256|P-384",
-         "ECC", True, "critical",
-         "Replace ECDSA/ECDH with ML-DSA (signatures) and ML-KEM (key exchange).",
-         "NIST FIPS 203/204, CNSA 2.0 (2030 deadline)"),
-    Rule("Diffie-Hellman", r"\bDiffieHellman\b|\bDHParameterSpec\b|\bDHKeyPair\b",
-         "DH", True, "high",
-         "Replace classical DH with ML-KEM (FIPS 203) for key establishment.",
-         "NIST FIPS 203"),
-    Rule("Hash-based signature gap", r"\bDSA\b(?!ML)",
-         "DSA", True, "high",
-         "Migrate DSA signatures to ML-DSA (FIPS 204) or SLH-DSA (FIPS 205).",
-         "NIST FIPS 204/205"),
-    Rule("Deprecated symmetric cipher", r"\bDES\b|\b3DES\b|DESede|\bRC4\b",
-         "Symmetric", False, "high",
-         "Retire in favor of AES-256-GCM (still quantum-resistant with sufficient key size).",
-         "NIST SP 800-131A"),
-    Rule("Weak hash function", r"\bMD5\b|\bSHA1\b|\bSHA-1\b",
-         "Hash", False, "medium",
-         "Migrate to SHA-256/SHA-3; required before adopting ML-DSA hash-and-sign flows.",
-         "NIST SP 800-131A"),
-    Rule("Certificate / key material", r"\.pem\b|\.p12\b|\.pfx\b|\.crt\b|BEGIN (RSA |EC )?PRIVATE KEY",
-         "PKI", True, "medium",
-         "Inventory issuing CA and re-issue certificate chain using ML-DSA once CA supports it.",
-         "CNSA 2.0 PKI transition guidance"),
-    Rule("TLS legacy key exchange", r"TLS_RSA_|TLS_ECDHE_|kx=RSA|kx=ECDHE",
-         "TLS", True, "medium",
-         "Enable hybrid PQC key exchange (X25519MLKEM768) in TLS 1.3 configuration.",
-         "IETF hybrid PQC TLS draft"),
-]
-
-_COMPILED = [(r, re.compile(r.pattern, re.IGNORECASE)) for r in RULES]
-
-RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-
-
-def scan_text(text: str) -> List[Dict]:
-    findings = []
+def scan_text(text: str) -> list[Finding]:
+    findings: list[Finding] = []
     lines = text.splitlines()
-    for i, line in enumerate(lines, start=1):
-        for rule, compiled in _COMPILED:
-            if compiled.search(line):
-                findings.append({
-                    "line": i,
-                    "snippet": line.strip()[:120],
-                    "algorithm": rule.name,
-                    "family": rule.family,
-                    "quantum_vulnerable": rule.quantum_vulnerable,
-                    "risk": rule.risk,
-                    "recommendation": rule.recommendation,
-                    "standard_ref": rule.standard_ref,
-                })
-    findings.sort(key=lambda f: RISK_ORDER.get(f["risk"], 9))
+    for lineno, line in enumerate(lines, start=1):
+        for name, spec in PATTERNS.items():
+            if spec["regex"].search(line):
+                findings.append(
+                    Finding(
+                        algorithm=name,
+                        severity=spec["severity"],
+                        line=lineno,
+                        snippet=line.strip()[:160],
+                        risk=spec["risk"],
+                        pqc_recommendation=spec["pqc"],
+                        effort=spec["effort"],
+                    )
+                )
     return findings
 
 
-def summarize(findings: List[Dict]) -> Dict:
-    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    quantum_vulnerable_count = 0
+def build_roadmap(findings: list[Finding]) -> list[dict]:
+    """Prioritize findings into a migration roadmap, ranked by risk score."""
+    grouped: dict[str, dict] = {}
     for f in findings:
-        counts[f["risk"]] = counts.get(f["risk"], 0) + 1
-        if f["quantum_vulnerable"]:
-            quantum_vulnerable_count += 1
-    return {
-        "total_findings": len(findings),
-        "quantum_vulnerable_count": quantum_vulnerable_count,
-        "by_risk": counts,
-    }
+        g = grouped.setdefault(
+            f.algorithm,
+            {
+                "algorithm": f.algorithm,
+                "occurrences": 0,
+                "severity": f.severity,
+                "risk": f.risk,
+                "pqc_recommendation": f.pqc_recommendation,
+                "effort": f.effort,
+                "lines": [],
+            },
+        )
+        g["occurrences"] += 1
+        g["lines"].append(f.line)
 
+    roadmap = list(grouped.values())
+    for item in roadmap:
+        weight = SEVERITY_WEIGHT.get(item["severity"], 1)
+        item["priority_score"] = round(weight * (1 + 0.1 * item["occurrences"]), 2)
 
-def build_roadmap(findings: List[Dict]) -> List[Dict]:
-    """Group findings by algorithm family and produce a prioritized,
-    time-boxed migration plan aligned with CNSA 2.0 phase deadlines."""
-    families: Dict[str, List[Dict]] = {}
-    for f in findings:
-        families.setdefault(f["family"], []).append(f)
-
-    phase_map = {
-        "critical": ("Phase 1: 2025-2027", "Immediate — public-key exchange & signatures exposed to harvest-now-decrypt-later attacks."),
-        "high": ("Phase 2: 2027-2030", "High priority — must be remediated before CNSA 2.0 2030 checkpoint."),
-        "medium": ("Phase 3: 2030-2033", "Medium priority — schedule alongside routine cert/library rotation."),
-        "low": ("Phase 4: 2033-2035", "Low priority — remediate opportunistically."),
-    }
-
-    roadmap = []
-    for family, items in sorted(
-        families.items(),
-        key=lambda kv: min(RISK_ORDER.get(i["risk"], 9) for i in kv[1]),
-    ):
-        top_risk = min(items, key=lambda i: RISK_ORDER.get(i["risk"], 9))["risk"]
-        phase, phase_desc = phase_map.get(top_risk, phase_map["low"])
-        recommendations = sorted(set(i["recommendation"] for i in items))
-        standards = sorted(set(i["standard_ref"] for i in items))
-        roadmap.append({
-            "family": family,
-            "occurrences": len(items),
-            "priority": top_risk,
-            "phase": phase,
-            "phase_description": phase_desc,
-            "recommendations": recommendations,
-            "standards": standards,
-            "example_lines": [i["line"] for i in items][:5],
-        })
+    roadmap.sort(key=lambda x: x["priority_score"], reverse=True)
+    for idx, item in enumerate(roadmap, start=1):
+        item["priority_rank"] = idx
     return roadmap
